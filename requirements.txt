@@ -1,0 +1,30 @@
+# ============================================================================
+# requirements.txt - Updated dependencies for Vault Messenger
+# ============================================================================
+
+# GUI Framework
+PyQt6>=6.4.2
+PyQt6-sip>=13.5.0
+
+# Cryptography (NaCl/libsodium)
+PyNaCl>=1.5.0
+
+# Signal/Slot System
+PySignal>=1.1.1
+
+# Networking & Compression
+msgpack>=1.0.5
+pyzstd>=0.15.7
+
+# Platform-specific directory handling (XDG Linux compliance)
+platformdirs>=4.0.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Process monitoring
+psutil>=5.9.8
+
+# Type checking support (optional, for development)
+# mypy>=1.5.0
+# types-PyQt6>=6.4.0
