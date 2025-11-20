@@ -1,556 +1,599 @@
-# Copyright [2025] [ecki]
-# SPDX-License-Identifier: Apache-2.0
-
-"""
-Vault Messenger GUI Module
-
-Provides PyQt6-based graphical interface with proper threading,
-input validation, and error handling.
-"""
-
+import Messenger.Message
+import bert_utils.bert_helper
+import bert_utils.helper_ip
+import bert_utils.helper_multicast
+import bert_utils.gui.BertrandtServiceDiscovery
+import bert_utils.helper_udp
+import datetime
 import json
-import logging
 import os
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import random
+import threading
+import time
 
+import Message
 import PyQt6.QtCore
 import PyQt6.QtGui
 import PyQt6.QtWidgets
+import PIL
+import PIL.ImageQt
 import PySignal
 
-import Message
-import vault_config
 
-logger = logging.getLogger(__name__)
+# TODO UDP & Encryption from Helper
 
-# Constants
-VALID_PORT_MIN = 1500
-VALID_PORT_MAX = 65000
-DEFAULT_RECV_PORT = 11000
-MESSAGE_DISPLAY_LIMIT = 1000  # Max messages in list
+class MessengerGui:
+    gui_send_text = PySignal.ClassSignal()
+    gui_send_img = PySignal.ClassSignal()
+    gui_send_file = PySignal.ClassSignal()
 
+    def __init__(self):
+        self.filename = "{}/{}".format(os.getcwd(), "config/config.json")
+        self.data = bert_utils.bert_helper.json_file_read(self.filename)
+        addr = self.data.get("addr", "")
+        recv_port = self.data.get("recv_port", random.randint(1500, 65000))
+        self.data.update({"recv_port": recv_port})
 
-class InputValidator:
-    """Centralized input validation utilities."""
+        self.priv_key = self.data.get("priv_key")
+        self.pub_key = self.data.get("pub_key", "")
+        if not self.priv_key:
+            self.pub_key, self.priv_key = bert_utils.bert_helper.generate_keys_asym()
+        if not self.pub_key:
+            self.pub_key = bert_utils.bert_helper.generate_pub_key(self.priv_key)
+        self.data.update({"pub_key": self.pub_key})
+        self.data.update({"priv_key": self.priv_key})
+        bert_utils.bert_helper.json_file_write(self.data, self.filename)
 
-    @staticmethod
-    def validate_port(port_input: str) -> Tuple[bool, Optional[int], str]:
-        """
-        Validate port number input.
+        self.bsd_type = self.data.get("bsd_type", "BertMessenger")
+        self.data.update({"bsd_type": self.bsd_type})
+        self.bsd_publisher = bert_utils.helper_multicast.BertMultiPublisher(timeout=2)
 
-        Returns:
-            Tuple of (is_valid, port_int, error_message)
-        """
-        try:
-            port = int(port_input.strip())
-        except ValueError:
-            return False, None, "Port must be a number"
-
-        if port < VALID_PORT_MIN or port > VALID_PORT_MAX:
-            return (
-                False,
-                None,
-                f"Port must be between {VALID_PORT_MIN} and {VALID_PORT_MAX}",
-            )
-
-        return True, port, ""
-
-    @staticmethod
-    def validate_ip(ip_input: str) -> Tuple[bool, str]:
-        """
-        Validate IP address (basic check).
-
-        Returns:
-            Tuple of (is_valid, error_message)
-        """
-        ip_input = ip_input.strip()
-
-        if not ip_input:
-            return False, "IP address cannot be empty"
-
-        parts = ip_input.split(".")
-        if len(parts) != 4:
-            return False, "Invalid IP format (use a.b.c.d)"
-
-        try:
-            for part in parts:
-                num = int(part)
-                if num < 0 or num > 255:
-                    return False, f"Invalid IP octet: {num}"
-        except ValueError:
-            return False, "IP address must contain only numbers and dots"
-
-        return True, ""
-
-    @staticmethod
-    def validate_name(name_input: str) -> Tuple[bool, str]:
-        """
-        Validate user name.
-
-        Returns:
-            Tuple of (is_valid, error_message)
-        """
-        name = name_input.strip()
-
-        if not name:
-            return False, "Name cannot be empty"
-
-        if len(name) > 100:
-            return False, "Name too long (max 100 characters)"
-
-        # Allow alphanumeric, spaces, hyphens, underscores
-        if not all(c.isalnum() or c in " -_" for c in name):
-            return False, "Name contains invalid characters"
-
-        return True, ""
-
-
-class NetworkWorker(PyQt6.QtCore.QObject):
-    """Worker thread for network operations (non-blocking)."""
-
-    # Signals
-    finished = PySignal.ClassSignal()
-    error = PySignal.ClassSignal()
-    progress = PySignal.ClassSignal()
-
-    def __init__(self) -> None:
-        """Initialize worker."""
-        super().__init__()
-        self._stop_requested = False
-
-    def stop(self) -> None:
-        """Request worker to stop."""
-        self._stop_requested = True
-
-    def send_message(self, message: Message.Message, addr: Optional[Tuple[str, int]] = None) -> None:
-        """
-        Send message (placeholder for actual implementation).
-
-        Args:
-            message: Message to send
-            addr: Target address
-        """
-        try:
-            # Placeholder: actual sending would happen here
-            logger.debug("Sending message from worker thread")
-            self.progress.emit(f"Sent: {message.get_type()}")
-            self.finished.emit()
-        except Exception as e:
-            logger.error("Network worker error: %s", e)
-            self.error.emit(str(e))
-
-
-class MessengerGui(PyQt6.QtWidgets.QWidget):
-    """
-    Main messenger GUI window with improved threading and validation.
-
-    Features:
-    - Proper QThread-based worker threads (no blocking GUI)
-    - Input validation for all user inputs
-    - Secure config file handling
-    - Comprehensive error messages
-    - Type hints throughout
-    """
-
-    def __init__(self) -> None:
-        """Initialize GUI."""
-        super().__init__()
-
-        self.logger = logging.getLogger(__name__)
-        self.logger.info("Initializing MessengerGui")
-
-        # Configuration
-        self.config = vault_config.VaultConfig(
-            app_name="VaultMessenger",
-            use_encryption=True,
-        )
-        self.config.load()
-
-        # Network state
-        self._network_thread: Optional[PyQt6.QtCore.QThread] = None
-        self._network_worker: Optional[NetworkWorker] = None
-        self._message_count = 0
-
-        # UI Setup
-        self._setup_ui()
-        self._restore_window_state()
-        self._start_network_worker()
-
-        self.logger.info("MessengerGui initialized")
-
-    def _setup_ui(self) -> None:
-        """Setup user interface."""
-        self.setWindowTitle(
-            self.config.get_or_create_string("gui.title", "Vault Messenger")
-        )
-        self.setGeometry(100, 100, 800, 600)
-
-        layout = PyQt6.QtWidgets.QVBoxLayout()
-
-        # Title
-        title_label = PyQt6.QtWidgets.QLabel("Vault Messenger")
-        title_font = title_label.font()
-        title_font.setPointSize(14)
-        title_font.setBold(True)
-        title_label.setFont(title_font)
-        layout.addWidget(title_label)
-
-        # Output area
-        output_label = PyQt6.QtWidgets.QLabel("Messages:")
-        layout.addWidget(output_label)
-
+        self.app = PyQt6.QtWidgets.QApplication([])
+        self.main_window = PyQt6.QtWidgets.QWidget()
+        self.main_window.setWindowTitle(self.data.get("title", "Messenger"))
+        self.layout = PyQt6.QtWidgets.QGridLayout()
+        self.main_window.setLayout(self.layout)
+        self.main_window.show()
+        # icon settings
+        if self.data.get("icon", False):
+            self.main_window.setWindowIcon(PyQt6.QtGui.QIcon(self.data.get("icon")))
+        self.check_addr_in_config()
+        # label
+        output_label = PyQt6.QtWidgets.QLabel("Ausgabe:")
+        self.layout.addWidget(output_label, 0, 0)
+        # listbox
         self.output_box = PyQt6.QtWidgets.QListWidget()
-        self.output_box.setMinimumHeight(300)
-        layout.addWidget(self.output_box)
-
-        # Input area
-        input_label = PyQt6.QtWidgets.QLabel("Your message:")
-        layout.addWidget(input_label)
-
-        input_layout = PyQt6.QtWidgets.QHBoxLayout()
-
+        self.output_box.addItem("Hallo")
+        self.layout.addWidget(self.output_box, 1, 0, 1, 6)
+        # label
+        self.tb_label = PyQt6.QtWidgets.QLabel("Eingabe:")
+        self.layout.addWidget(self.tb_label, 2, 0)
+        # textbox
         self.textbox = PyQt6.QtWidgets.QLineEdit()
-        self.textbox.setMinimumHeight(35)
-        self.textbox.setPlaceholderText("Type a message...")
-        self.textbox.returnPressed.connect(self._on_click_button_send)
-        input_layout.addWidget(self.textbox)
-
+        self.textbox.setMinimumSize(100, 35)
+        self.layout.addWidget(self.textbox, 3, 0, 1, 4)
+        # button send
         btn_send = PyQt6.QtWidgets.QPushButton("Send")
-        btn_send.setMinimumHeight(35)
-        btn_send.clicked.connect(self._on_click_button_send)
-        input_layout.addWidget(btn_send)
+        btn_send.setMinimumSize(50, 35)
+        btn_send.clicked.connect(self.on_click_button_send)
+        self.layout.addWidget(btn_send, 3, 4, 1, 2)
+        # button options
+        btn_options = PyQt6.QtWidgets.QPushButton("Einstellungen")
+        btn_options.clicked.connect(self.on_click_button_options)
+        self.layout.addWidget(btn_options, 4, 0, 1, 2)
+        # button state
+        btn_current_state = PyQt6.QtWidgets.QPushButton("Aktueller Zustand")
+        btn_current_state.clicked.connect(self.on_click_button_state)
+        self.layout.addWidget(btn_current_state, 4, 2, 1, 1)
+        # button reset
+        btn_reset = PyQt6.QtWidgets.QPushButton("Reset")
+        btn_reset.clicked.connect(self.on_click_button_reset)
+        self.layout.addWidget(btn_reset, 4, 3, 1, 1)
+        # button send image
+        btn_send_img = PyQt6.QtWidgets.QPushButton("Bild senden")
+        btn_send_img.clicked.connect(self.on_click_btn_send_img)
+        self.layout.addWidget(btn_send_img, 4, 4, 1, 2)
+        # button send datei
+        btn_send_file = PyQt6.QtWidgets.QPushButton("Datei senden")
+        btn_send_file.clicked.connect(self.on_click_button_send_file)
+        self.layout.addWidget(btn_send_file, 5, 1, 1, 3)
 
-        layout.addLayout(input_layout)
+        self.options_window = None
+        if not addr:
+            self.on_click_button_options()
 
-        # Control buttons
-        button_layout = PyQt6.QtWidgets.QHBoxLayout()
+        # additional settings
+        self.sock = bert_utils.helper_udp.UDPSocketClass(recv_port=recv_port)
+        threading.Timer(0.5, self.thread_start_sock).start()
+        self.mh = Message.MessageHandler()
+        # self.me = Message.MessageEncryption(self.priv_key)
+        self.sock.pkse.set_private_key(self.priv_key)
 
-        btn_options = PyQt6.QtWidgets.QPushButton("Settings")
-        btn_options.clicked.connect(self._on_click_button_options)
-        button_layout.addWidget(btn_options)
+        # sending from mh -> sock to all
+        self.mh.mh_send_data.connect(self.sock.send_data)
 
-        btn_state = PyQt6.QtWidgets.QPushButton("Status")
-        btn_state.clicked.connect(self._on_click_button_state)
-        button_layout.addWidget(btn_state)
+        # recv sock -> mh
+        self.sock.udp_recv_data.connect(self.mh.recv_msg)
 
-        btn_clear = PyQt6.QtWidgets.QPushButton("Clear")
-        btn_clear.clicked.connect(self._on_click_button_clear)
-        button_layout.addWidget(btn_clear)
+        # mh recv/ send text <-> gui
+        self.mh.mh_recv_text.connect(self.on_recv_text)
+        self.gui_send_text.connect(self.mh.send_txt_msg)
 
-        layout.addLayout(button_layout)
+        # mh recv/ send img <-> gui
+        self.mh.mh_recv_img.connect(self.on_recv_img)
+        self.gui_send_img.connect(self.mh.send_img_msg)
 
-        self.setLayout(layout)
+        self.mh.mh_recv_file.connect(self.on_recv_file)
+        self.gui_send_file.connect(self.mh.send_file_msg)
 
-    def _start_network_worker(self) -> None:
-        """Start network worker thread."""
+        self.stop_update_ctl_send = False
+        self.ignore_addr = []
+        self.addr_box = None
+        threading.Timer(5, self.update_ctl_send).start()
+
+        # mh recv control message -> gui
+        self.mh.mh_recv_control.connect(self.on_recv_ctl)
+        self.addr_name = self.data.get("addr_name", {})
+
+        self.mbox_data = {}
+        self.img_to_show = None
+        self.img_window = None
+        self.mb_timer = PyQt6.QtCore.QTimer()
+        self.mb_timer.timeout.connect(self.timer_mbox_check)
+        self.mb_timer.start(2000)
+
+    def on_recv_ctl(self, data="", addr=""):
+        # data = json.dumps({"name": "irgs", "addr": ["127.0.0.1", 32272], "key": "12345"})
+        # addr = ("127.0.0.1", 32272)
+        print("ctl data: {} from: {}".format(data.replace("\n", ""), addr))
         try:
-            self._network_thread = PyQt6.QtCore.QThread()
-            self._network_worker = NetworkWorker()
-            self._network_worker.moveToThread(self._network_thread)
-
-            # Connect signals
-            self._network_thread.started.connect(self._on_network_worker_started)
-            self._network_worker.finished.connect(self._on_network_worker_finished)
-            self._network_worker.error.connect(self._on_network_worker_error)
-
-            self._network_thread.start()
-            self.logger.info("Network worker thread started")
-
-        except Exception as e:
-            self.logger.error("Failed to start network worker: %s", e)
-            PyQt6.QtWidgets.QMessageBox.critical(
-                self,
-                "Initialization Error",
-                f"Failed to start network services: {e}",
-            )
-
-    def _on_network_worker_started(self) -> None:
-        """Called when network worker starts."""
-        self.logger.debug("Network worker started")
-
-    def _on_network_worker_finished(self) -> None:
-        """Called when network operation finishes."""
-        self.logger.debug("Network operation finished")
-
-    def _on_network_worker_error(self, error_msg: str) -> None:
-        """
-        Called when network error occurs.
-
-        Args:
-            error_msg: Error message
-        """
-        self.logger.error("Network worker error: %s", error_msg)
-        self._add_message(f"⚠️ Network Error: {error_msg}")
-
-    def _add_message(self, text: str) -> None:
-        """
-        Add message to output box with timestamp.
-
-        Args:
-            text: Message text
-        """
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        full_text = f"[{timestamp}] {text}"
-
-        self.output_box.addItem(full_text)
-        self._message_count += 1
-
-        # Limit message history
-        while self.output_box.count() > MESSAGE_DISPLAY_LIMIT:
-            self.output_box.takeItem(0)
-
-        # Scroll to bottom
-        self.output_box.scrollToBottom()
-
-    def _on_click_button_send(self) -> None:
-        """Handle send button click."""
-        text = self.textbox.text().strip()
-
-        if not text:
-            self._add_message("⚠️ Message cannot be empty")
+            data = json.loads(data)
+        except:
             return
-
-        if len(text) > 10000:
-            PyQt6.QtWidgets.QMessageBox.warning(
-                self,
-                "Message Too Long",
-                "Message exceeds maximum length (10000 characters)",
-            )
+        name = data.get("name", "")
+        key = data.get("key", "")
+        addr_data = data.get("addr", "")
+        self.sock.pkse.update_key(addr_data, key)
+        if addr[0] != addr_data[0]:
             return
+        if addr and addr_data not in self.sock.mask_addresses and addr_data not in self.ignore_addr and not self.addr_box:
+            # print("new addr {}".format(addr_data))
+            text = "New incoming connection from {}\n\nWant to use for the session (Ok), Save in config, Ignore?\n".format(
+                name)
+            title = "New Connection"
+            buttons = {"Ok": False, "Save": False, "Ignore": False}
+            self.mbox_data = {"text": text, "title": title, "button": buttons, "name": name, "addr_data": addr_data,
+                              "type": "addr"}
 
-        try:
-            # Create and send message
-            msg = Message.Message()
-            msg.set_text(text)
+    def timer_mbox_check(self):
+        # print("timer mbox")
+        # print(self.mbox_data)
+        if self.mbox_data.get("type", "") == "addr":
+            self.open_mbox_addr_window(self.mbox_data)
+            self.mbox_data = {}
+        if self.img_to_show:
+            msg_box = PyQt6.QtWidgets.QMessageBox()
+            msg_box.setText("You received new image. Do you want to open it?")
+            msg_box.addButton(PyQt6.QtWidgets.QMessageBox.StandardButton.Yes)
+            msg_box.addButton(PyQt6.QtWidgets.QMessageBox.StandardButton.No)
+            res = msg_box.exec()
+            if res == PyQt6.QtWidgets.QMessageBox.StandardButton.Yes:
+                self.img_window = MessengerPictures(self.img_to_show)
+                self.img_to_show = None
+                self.img_window.show()
+            else:
+                self.img_to_show = None
 
-            self._add_message(f"→ You: {text}")
-            self.textbox.clear()
+    def check_addr_in_config(self):  # TODO
+        now = time.time()
+        timeout = 60 * 60 * 24 * 7
+        addresses = []
+        for addr in self.data.get("addr", ""):
+            if (float(addr[2]) + float(timeout)) < now:
+                # print("Old connections has been deleted")
+                pass
+            else:
+                # print("Neu")
+                addresses.append(addr)
+        self.data.update({"addr": addresses})
+        # print(self.data)
 
-            self.logger.debug("Message sent: %s", msg.get_id())
+    def open_mbox_addr_window(self, mbox_data):
+        print("open mbox")
+        if not self.addr_box:
+            self.addr_box = MessengerGuiMessageBox(mbox_data)
+            self.addr_box.close_window.connect(self.close_mbox_addr_window)
+            self.addr_box.show()
 
-        except Message.MessageError as e:
-            self.logger.error("Message creation failed: %s", e)
-            PyQt6.QtWidgets.QMessageBox.warning(
-                self,
-                "Message Error",
-                f"Failed to create message: {e}",
-            )
+    def close_mbox_addr_window(self, mbox_data):
+        print("close mbox")
+        if mbox_data:
+            print("Data recv: {}".format(mbox_data))
+            button_ok = mbox_data.get("button", {}).get("Ok", False)
+            button_save = mbox_data.get("button", {}).get("Save", False)
+            button_ignore = mbox_data.get("button", {}).get("Ignore", False)
+            name = mbox_data.get("name")
+            addr_data = mbox_data.get("addr_data")
+            recv_ip = addr_data[0]
+            recv_port = addr_data[1]
+            addr = []
+            time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            addr.append([recv_ip, recv_port, time_str])
+            if button_save:
+                # self.data.update({"addr": addr_data})
+                self.data.update({"addr": addr})
+                self.sock.update(addr=addr_data)
+                if name:
+                    self.addr_name.update({str(addr_data[0]): (name, time.time())})
+                    self.data.update({"name": self.addr_name})
+                bert_utils.bert_helper.json_file_write(self.data, self.filename)
+            elif button_ok:
+                self.data.update({"addr": addr})
+                self.sock.update(addr=addr_data)
+                if name:
+                    self.addr_name.update({tuple(addr_data): (name, time.time())})
+            else:
+                self.ignore_addr.append(addr_data)
+                if name:
+                    self.addr_name.update({tuple(addr_data): (name, time.time())})
+            self.addr_box = None
+        self.addr_box = None
 
-    def _on_click_button_options(self) -> None:
-        """Handle settings button click."""
-        try:
-            dialog = SettingsDialog(self.config, parent=self)
-            if dialog.exec() == PyQt6.QtWidgets.QDialog.DialogCode.Accepted:
-                self.config.save()
-                self.logger.info("Settings saved")
-                self._add_message("✓ Settings updated")
-        except Exception as e:
-            self.logger.error("Settings dialog error: %s", e)
-            PyQt6.QtWidgets.QMessageBox.critical(
-                self,
-                "Settings Error",
-                f"Failed to open settings: {e}",
-            )
+    def update_ctl_send(self):
+        ip = bert_utils.helper_ip.get_ips()[0][0]
+        recv_port = self.sock.recv_port
+        name = self.data.get("name", "Test")
+        key = self.pub_key
+        bsd_data = {"addr": (ip, recv_port), "name": name, "key": key, "type": self.bsd_type}
+        self.bsd_publisher.update_message(json.dumps(bsd_data))
+        ctl_data = {"addr": (ip, recv_port), "name": name, "key": key}
+        self.mh.send_ctl_msg(ctl_data)
+        if not self.stop_update_ctl_send:
+            threading.Timer(10, self.update_ctl_send).start()
 
-    def _on_click_button_state(self) -> None:
-        """Handle status button click."""
-        addr = self.config.get("network.recv_port", DEFAULT_RECV_PORT)
-        self._add_message(f"📡 Listening on port {addr}")
+    def on_click_button_send(self):
+        if not self.textbox.text():
+            last_item_index = self.output_box.count() - 1
+            item = self.output_box.item(last_item_index).text()
+            if not item == "Bitte text eingeben":
+                self.output_box.addItem("Bitte text eingeben")
+        else:
+            time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    def _on_click_button_clear(self) -> None:
-        """Handle clear button click."""
+            threading.Timer(0.1, self.send_text, args=[self.textbox.text()]).start()
+            self.output_box.addItem("{}: try sending: {}".format(time_str, self.textbox.text()))
+            self.textbox.setText("")
+
+    def send_text(self, text):
+        self.gui_send_text.emit(text)
+
+    def on_recv_text(self, text, addr=""):
+        time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if addr and self.addr_name.get(tuple(addr), ("", 1))[0]:
+            self.output_box.addItem(
+                "{}: from: {} received: {}".format(time_str, self.addr_name.get(addr[0], ("", 1))[0], text))
+        else:
+            self.output_box.addItem("{}: received: {}".format(time_str, text))
+
+    def on_recv_img(self, img_str="", addr=""):
+        # print(img_str)
+        img_bytes = bert_utils.bert_helper.from_base64_byte(img_str)
+        time_str = datetime.datetime.now().strftime("%Y%m%d_%H:%M:%S")
+
+        if addr and self.addr_name.get(addr[0], ("", 1))[0]:
+            self.output_box.addItem(
+                "{}: from: {} received: {}".format(time_str, self.addr_name.get(addr[0], ("", 1))[0], img_bytes))
+        else:
+            self.output_box.addItem("{}: received: {}".format(time_str, img_bytes))
+
+        if img_bytes:
+            self.img_to_show = img_bytes
+
+    def on_recv_file(self, message_content, addr=""):
+
+        """recv data message, convert data to byte and filename, opens file dialog, save byte as under choosen filename
+
+        :param message_content: message that we recv
+        :type message_content: str
+
+        """
+
+        # Json loads, nachricht inhalt, send file == dict
+        send_file = json.loads(message_content)
+        filename = send_file.get("Dateiname")
+        file_str = send_file.get("Inhalt")
+        # from base64 byte
+        file_byte = bert_utils.bert_helper.from_base64_byte(file_str)
+        #safe dialog,
+        filename = PyQt6.QtWidgets.QFileDialog.getSaveFileName(None, "Save File", filename, "Image File (*.*)")  # filename as String
+        if filename:
+            f = open(filename[0], mode='wb')
+            f.write(file_byte)
+            f.close()
+
+    def on_click_button_send_file(self):
+
+        """opens file dialog, choose file, create data message, send data message
+
+        """
+        file_dialog = PyQt6.QtWidgets.QFileDialog()
+        file_dialog.setFileMode(PyQt6.QtWidgets.QFileDialog.FileMode.ExistingFile)
+        file_dialog.getOpenFileName()
+        filename = file_dialog.selectedFiles()
+        if filename:
+            f = open(filename[0], mode='rb')
+            file_byte = f.read()
+            file_str = bert_utils.bert_helper.to_base64_str(file_byte)
+            # file_bytes = bert_utils.bert_helper.to_base64_str(file_str)
+            send_files = {"Dateiname": filename, "Inhalt": file_str}
+            message_content = json.dumps(send_files)
+            self.gui_send_file.emit(message_content)
+
+    def on_click_button_options(self):
+        self.options_window = MessengerGuiOptions(self.data)
+        self.options_window.close_window.connect(self.on_close_options_window)
+        self.options_window.show()
+
+    def on_close_options_window(self, options_data):
+        print("Options data: {}".format(options_data))
+        if not options_data:
+            print("no data recv")
+            options_data = self.data
+        for key, value in options_data.items():
+            self.data.update({key: value})
+        self.options_window.close_window.disconnect(self.on_close_options_window)
+        self.options_window = None
+        bert_utils.bert_helper.json_file_write(self.data, self.filename)
+        threading.Timer(0.5, self.thread_start_sock).start()
+
+    def thread_start_sock(self):
+        # print(self.data.get("addr"))
+        # print(type(self.data.get("addr")))
+        addr = self.data.get("addr", "")
+        for address in addr:
+            self.sock.update(address, recv_port=self.data.get("recv_port", ""))
+
+    def on_click_button_state(self):
+        cur_state = ["127.0.0.1", "5000"]
+        last_item_index = self.output_box.count()
+        last_item_index = last_item_index - 1
+        for addr in self.sock.mask_addresses:
+            cur_state = "Send-Address: {} RecvPort: {}".format(addr, self.sock.recv_port)
+            if last_item_index < 1:
+                self.output_box.addItem(cur_state)
+            elif not cur_state == self.output_box.item(last_item_index).text():
+                self.output_box.addItem(cur_state)
+
+    def on_click_btn_send_img(self):
+        time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # filename = PyQt6.QtWidgets.QFileDialog.getOpenFileName(None, "Open file", 'C://images/', "Image files (*.img *.png *.jpg *.gif)") # filename as String
+        dialog = PyQt6.QtWidgets.QFileDialog(None)
+        dialog.setFileMode(PyQt6.QtWidgets.QFileDialog.FileMode.AnyFile)
+        dialog.setDirectory(os.path.expanduser("~") + "/Downloads/")
+        dialog.setNameFilter("Image files (*.img *.png *.jpg *.gif)")
+        if dialog.exec():
+            filename = dialog.selectedFiles()
+            if filename[0]:
+                file = open(filename[0], "rb")
+                data = file.read()
+                data_str = bert_utils.bert_helper.to_base64_str(data)
+                self.output_box.addItem("{}: try sending: {}".format(time_str, filename[0]))
+                threading.Timer(1, self.send_img, args=[data_str]).start()
+
+    def send_img(self, img_str):
+        self.gui_send_img.emit(img_str)
+
+    def on_click_button_reset(self):
         self.output_box.clear()
-        self._message_count = 0
-        self.logger.debug("Message history cleared")
+        self.output_box.addItem("Ausgabelist wurde gelöscht")
 
-    def _restore_window_state(self) -> None:
-        """Restore window state from config."""
-        try:
-            geometry = self.config.get("gui.geometry")
-            if geometry and isinstance(geometry, dict):
-                self.setGeometry(
-                    geometry.get("x", 100),
-                    geometry.get("y", 100),
-                    geometry.get("width", 800),
-                    geometry.get("height", 600),
-                )
-        except Exception as e:
-            self.logger.debug("Failed to restore window state: %s", e)
+    # todo timer function removing to long unused addr, user
+    # when no addr survives - ?unconnect send, connect options?
 
-    def _save_window_state(self) -> None:
-        """Save window state to config."""
-        try:
-            rect = self.geometry()
-            self.config.set(
-                "gui.geometry",
-                {"x": rect.x(), "y": rect.y(), "width": rect.width(), "height": rect.height()},
-            )
-            self.config.save()
-        except Exception as e:
-            self.logger.warning("Failed to save window state: %s", e)
+    def run(self):
+        self.app.exec()
 
-    def closeEvent(self, event: PyQt6.QtGui.QCloseEvent) -> None:
-        """Handle window close event."""
-        self._save_window_state()
-
-        # Stop network worker
-        if self._network_worker:
-            self._network_worker.stop()
-
-        if self._network_thread:
-            self._network_thread.quit()
-            self._network_thread.wait(timeout=5000)
-
-        super().closeEvent(event)
+    def stop(self):
+        self.stop_update_ctl_send = True
+        self.sock.stop()
+        self.mh.stop()
+        self.bsd_publisher.stop()
 
 
-class SettingsDialog(PyQt6.QtWidgets.QDialog):
-    """Settings dialog with input validation."""
+class MessengerPictures(PyQt6.QtWidgets.QWidget):
+    def __init__(self, data=""):
+        super().__init__()
+        self.layout = PyQt6.QtWidgets.QVBoxLayout()
+        self.setLayout(self.layout)
 
-    def __init__(
-        self,
-        config: vault_config.VaultConfig,
-        parent: Optional[PyQt6.QtWidgets.QWidget] = None,
-    ) -> None:
-        """
-        Initialize settings dialog.
+        # Qwidgets
+        # img label
+        self.img_label = PyQt6.QtWidgets.QLabel("test")
+        self.layout.addWidget(self.img_label)
 
-        Args:
-            config: Configuration object
-            parent: Parent widget
-        """
-        super().__init__(parent)
-        self.setWindowTitle("Settings")
-        self.setMinimumWidth(400)
+        # menu bar
+        menu_bar = PyQt6.QtWidgets.QMenuBar()
+        self.layout.setMenuBar(menu_bar)
 
-        self.config = config
-        self.logger = logging.getLogger(__name__)
+        # file menu
+        file_menu = PyQt6.QtWidgets.QMenu("&File", self)
+        menu_bar.addMenu(file_menu)
+        self.save_action = file_menu.addAction("💾 Save")
+        self.save_action.setShortcut("Ctrl+S")
+        self.save_action.triggered.connect(self.on_triggered_save)
+        file_menu.addSeparator()
+        self.exit_action = file_menu.addAction("❌ Exit")
+        self.exit_action.triggered.connect(self.on_triggered_exit)
+        # help menu
+        help_menu = PyQt6.QtWidgets.QMenu("&Help", self)
+        menu_bar.addMenu(help_menu)
+        self.test1_action = help_menu.addAction("test1")
+        self.test2_action = help_menu.addAction("test2")
 
-        self._setup_ui()
+        self.show_pict(data)
 
-    def _setup_ui(self) -> None:
-        """Setup settings dialog UI."""
-        layout = PyQt6.QtWidgets.QFormLayout()
+    def show_pict(self, img):
+        if img:
+            qp = PyQt6.QtGui.QPixmap()
+            qp.loadFromData(img, "png")
+            self.img_label.setPixmap(qp)
+            self.img_label.setPixmap(qp)
+        else:
+            self.img_label.setText("")
 
-        # User name
-        name_label = PyQt6.QtWidgets.QLabel("Display Name:")
-        self.name_input = PyQt6.QtWidgets.QLineEdit()
-        self.name_input.setText(self.config.get_or_create_string("user.name", "User"))
-        self.name_input.setMaxLength(100)
-        layout.addRow(name_label, self.name_input)
+    def on_triggered_save(self):
+        time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        images_path = os.path.expanduser("~") + "/Downloads/"
+        filename = '{}\\recv_image_{}.png'.format(images_path, time_str)
+        dialog = PyQt6.QtWidgets.QFileDialog.getSaveFileName(None, "Save Image", filename,
+                                                             "Image File (*.img *.png *.jpg *.gif)")
 
-        # Port
-        port_label = PyQt6.QtWidgets.QLabel("Listen Port:")
-        self.port_input = PyQt6.QtWidgets.QLineEdit()
-        port_value = str(self.config.get_or_create_int("network.recv_port", DEFAULT_RECV_PORT))
-        self.port_input.setText(port_value)
-        self.port_input.setValidator(PyQt6.QtGui.QIntValidator(VALID_PORT_MIN, VALID_PORT_MAX))
-        layout.addRow(port_label, self.port_input)
+    def on_triggered_exit(self):
+        self.close()
 
-        # Buttons
-        button_layout = PyQt6.QtWidgets.QHBoxLayout()
 
-        btn_cancel = PyQt6.QtWidgets.QPushButton("Cancel")
-        btn_cancel.clicked.connect(self.reject)
-        button_layout.addWidget(btn_cancel)
+class MessengerGuiMessageBox(PyQt6.QtWidgets.QWidget):
+    close_window = PySignal.ClassSignal()
 
-        btn_ok = PyQt6.QtWidgets.QPushButton("OK")
-        btn_ok.clicked.connect(self._validate_and_accept)
-        button_layout.addWidget(btn_ok)
-
-        layout.addRow(button_layout)
-
+    def __init__(self, data):
+        super().__init__()
+        layout = PyQt6.QtWidgets.QVBoxLayout()
+        self.data = data
         self.setLayout(layout)
+        text_label = PyQt6.QtWidgets.QLabel()
+        text_label.setText(str(self.data.get("text", "no text popup")))
+        self.setWindowTitle(self.data.get("title", "No Title"))
+        layout.addWidget(text_label)
+        layout.addWidget(self.generate_buttons())
 
-    def _validate_and_accept(self) -> None:
-        """Validate inputs and accept dialog."""
-        # Validate name
-        name = self.name_input.text()
-        is_valid, error = InputValidator.validate_name(name)
-        if not is_valid:
-            PyQt6.QtWidgets.QMessageBox.warning(self, "Invalid Name", error)
-            return
+    def generate_buttons(self):
+        widget = PyQt6.QtWidgets.QWidget()
+        layout = PyQt6.QtWidgets.QHBoxLayout()
+        for button in self.data.get("button", {"close": False}):
+            push_button = PyQt6.QtWidgets.QPushButton(button)
+            push_button.clicked.connect(self.on_button_click)
+            layout.addWidget(push_button)
+        widget.setLayout(layout)
+        return widget
 
-        # Validate port
-        port_text = self.port_input.text()
-        is_valid, port, error = InputValidator.validate_port(port_text)
-        if not is_valid:
-            PyQt6.QtWidgets.QMessageBox.warning(self, "Invalid Port", error)
-            return
+    def on_button_click(self):
+        sender = self.sender()
+        button_text = sender.text()
+        print("Button {} clicked".format(button_text))
+        if button_text:
+            buttons = self.data.get("button", {})
+            buttons.update({button_text: True})
+            self.data.update({"button": buttons})
+            print(self.data.get("button"))
+        self.close()
 
-        # Save to config
+    def closeEvent(self, a0: PyQt6.QtGui.QCloseEvent):
+        self.on_click_close()
+
+    def on_click_close(self):
+        self.close_window.emit(self.data)
+        self.close()
+
+
+class MessengerGuiOptions(PyQt6.QtWidgets.QWidget):
+    close_window = PySignal.ClassSignal()
+
+    def __init__(self, data):
+        super().__init__()
+        self.grid_layout = PyQt6.QtWidgets.QVBoxLayout()
+        self.data = data
+        self.setLayout(self.grid_layout)
+
+        name_label = PyQt6.QtWidgets.QLabel("Name:")
+        self.grid_layout.addWidget(name_label)
+        random_id_number = random.randint(0, 1000000000)
+        self.textbox_name = PyQt6.QtWidgets.QLineEdit(str(self.data.get("name", "Dave-{}".format(random_id_number))))
+        self.grid_layout.addWidget(self.textbox_name)
+
+        # text boxes
+        self.textboxes_addr = []
+        addresses = self.data.get("addr", ("127.0.0.1", 11000))
+        for address in addresses:
+            self.grid_layout.addWidget(self.ip_port_addr_widget(address))
+
+        bsd_add = PyQt6.QtWidgets.QPushButton("Add IP from BSD")
+        bsd_add.clicked.connect(self.on_click_add_ip_bsd)
+        self.grid_layout.addWidget(bsd_add)
+        self.bsd = None
+        # buttons
+        btn_cancel = PyQt6.QtWidgets.QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.on_click_close)
+        self.grid_layout.addWidget(btn_cancel)
+        btn_ok = PyQt6.QtWidgets.QPushButton("Ok")
+        btn_ok.clicked.connect(self.on_click_btn_ok)
+        self.grid_layout.addWidget(btn_ok)
+
+    def on_click_add_ip_bsd(self):
+        self.bsd = bert_utils.gui.BertrandtServiceDiscovery.BertrandtServiceDiscovery(type_filter="BertMessenger")
+        self.bsd.return_signal.connect(self.on_bsd_return)
+        self.bsd.show()
+
+    def on_bsd_return(self, value):
+        print("Mainwindow: {}".format(value))
+        # value = {'addr': ['192.168.72.23', 48521], 'name': 'Sebastian', 'key': '', 'type': 'BertMessenger'}
+        # bsp: {'addr': ['192.168.72.23', 48521], 'name': 'Sebastian', 'key': '', 'type': 'BertMessenger'}
+        return_ip = value.get("addr", "")[0]
+        return_port = value.get("addr", "")[1]
+        do_add = False
+        if return_ip and return_port:
+            for i in range(0, len(self.textboxes_addr)):
+                if str(return_ip) != str(self.textboxes_addr[i][0].text()) or str(return_port) != str(
+                        self.textboxes_addr[i][1].text()) and str(return_ip) not in bert_utils.helper_ip.get_ips():
+                    do_add = True
+        if do_add:
+            self.grid_layout.addWidget(self.ip_port_addr_widget(value.get("addr")))
+            # key zurück geben -> self.data, am rücksprung punkt dann an message encrypt geben
+
+        if not self.bsd.isVisible():
+            self.bsd = None
+
+    def ip_port_addr_widget(self, addr):
+        layout = PyQt6.QtWidgets.QHBoxLayout()
+        widget = PyQt6.QtWidgets.QWidget()
+        label_ip = PyQt6.QtWidgets.QLabel("IP:")
+        layout.addWidget(label_ip)
+        textbox_addr_ip = PyQt6.QtWidgets.QLineEdit(str(addr[0]))
+        layout.addWidget(textbox_addr_ip)
+        label_port = PyQt6.QtWidgets.QLabel("Port:")
+        layout.addWidget(label_port)
+        textbox_addr_port = PyQt6.QtWidgets.QLineEdit(str(addr[1]))
+        layout.addWidget(textbox_addr_port)
+        self.textboxes_addr.append((textbox_addr_ip, textbox_addr_port))
+        widget.setLayout(layout)
+        return widget
+
+    def closeEvent(self, a0: PyQt6.QtGui.QCloseEvent):
+        self.on_click_close()
+
+    def on_click_btn_ok(self):
         try:
-            self.config.set("user.name", name)
-            self.config.set("network.recv_port", port)
-            self.logger.info("Settings validated and saved: name=%s, port=%d", name, port)
-            self.accept()
+            addr = []
+            # print(len(self.textboxes_addr))
+            for addr_number in range(0, len(self.textboxes_addr)):
+                now = time.time()
+                # print("IP: {}, Port: {}".format(self.textboxes_addr[addr_number][0].text(), self.textboxes_addr[addr_number][1].text()))
+                addr.append(
+                    [self.textboxes_addr[addr_number][0].text(), int(self.textboxes_addr[addr_number][1].text()), now])
+            # print(addr)
+            self.data.update({"addr": addr, "name": self.textbox_name.text()})
+            print(self.data)
         except Exception as e:
-            self.logger.error("Failed to save settings: %s", e)
-            PyQt6.QtWidgets.QMessageBox.critical(
-                self,
-                "Save Error",
-                f"Failed to save settings: {e}",
-            )
+            print("{}".format(e))
+            pass
+        self.on_click_close()
+
+    def on_click_close(self):
+        self.close_window.emit(self.data)
+        self.close()
 
 
-def setup_logging(config: vault_config.VaultConfig) -> None:
-    """
-    Setup logging with file rotation.
-
-    Args:
-        config: Configuration object
-    """
-    import logging.handlers
-
-    log_level = config.get_or_create_string("logging.level", "INFO")
-    log_dir = config._config_dir / "logs"
-    log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / "messenger.log"
-
-    # File handler with rotation
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_file,
-        maxBytes=10_000_000,  # 10 MB
-        backupCount=5,
-    )
-    file_handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-    )
-
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(
-        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    )
-
-    # Root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, log_level))
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(console_handler)
-
-    logger.info("Logging initialized: level=%s, file=%s", log_level, log_file)
-
-
-def main() -> None:
-    """Main entry point."""
-    app = PyQt6.QtWidgets.QApplication([])
-
-    # Setup logging
-    config = vault_config.VaultConfig(app_name="VaultMessenger", use_encryption=True)
-    config.load()
-    setup_logging(config)
-
-    # Create and show window
-    window = MessengerGui()
-    window.show()
-
-    app.exec()
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    gui = MessengerGui()
+    gui.run()
+    gui.stop()

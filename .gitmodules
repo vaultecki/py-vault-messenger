@@ -1,0 +1,6 @@
+[submodule "libs/udp"]
+	path = libs/udp
+	url = git@github.com:vaultecki/py-vault-udp.git
+[submodule "libs/multicast"]
+	path = libs/multicast
+	url = git@github.com:vaultecki/py-vault-multicast.git
