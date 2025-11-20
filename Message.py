@@ -4,12 +4,10 @@ import random
 
 import nacl.encoding
 import nacl.hash
-import socket
 import threading
 import time
 import uuid
 import PySignal
-import bert_utils.bert_helper
 
 
 class Message:
@@ -163,12 +161,6 @@ class MessageHandler:
         self.list_send = {}
         self.recv_msg_buffer = {}
         self.timeout = timeout
-        self.keys = bert_utils.bert_helper.generate_keys_asym()
-        # self.filename = "{}/{}".format(os.getcwd(), "config/config.json")
-        # self.data = bert_utils.bert_helper.json_file_read(self.filename)
-        # self.data.update({"pub_key": self.keys[0]})
-        # self.data.update({"pri_key": self.keys[1]})
-        # bert_utils.bert_helper.json_file_write(self.data, self.filename)
         self.thread_stop = False
         threading.Timer(1, self.__check_recv_buffer).start()
 
@@ -220,8 +212,6 @@ class MessageHandler:
                 self.list_send.update({msg_id_part: time.time()})
                 # print(self.list_send)
 
-                # msg_in_byte = bert_utils.bert_helper.to_base64(msg)  # encrypted_msg
-                # msg_encrypted = bert_utils.bert_helper.encrypt_asym(self.keys[0], msg_in_byte)
                 self.mh_send_data.emit(msg)
 
                 time.sleep(0.5)
@@ -236,8 +226,6 @@ class MessageHandler:
 
     def recv_msg(self, recv_msg_json, addr=""):
         # print("Recv: {} from {}".format(recv_msg_json.replace("\n", ""), addr))
-        # decrypted_recv_msg_bytes = bert_utils.bert_helper.decrypt_asym(self.keys[1], recv_msg)   # decrypt
-        # recv_msg_json = bert_utils.bert_helper.from_base64_str(decrypted_recv_msg_bytes)
         try:
             # print(recv_msg_json)
             json.loads(recv_msg_json)

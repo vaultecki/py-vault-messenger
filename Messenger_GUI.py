@@ -1,9 +1,10 @@
-import Messenger.Message
-import bert_utils.bert_helper
-import bert_utils.helper_ip
-import bert_utils.helper_multicast
-import bert_utils.gui.BertrandtServiceDiscovery
-import bert_utils.helper_udp
+import Message
+import config_manager
+import base64
+import libs.udp.vault_ip as helper_ip
+import libs.multicast.vault_multicast as helper_multicast
+import libs.multicast.vault_multicast_service_discovery as multicast_gui
+import libs.udp.vault_udp_socket as helper_udp
 import datetime
 import json
 import os
@@ -28,8 +29,8 @@ class MessengerGui:
     gui_send_file = PySignal.ClassSignal()
 
     def __init__(self):
-        self.filename = "{}/{}".format(os.getcwd(), "config/config.json")
-        self.data = bert_utils.bert_helper.json_file_read(self.filename)
+        self.config_manager = config_manager.ConfigManager(Messenger, "config.json")
+        self.data = self.config_manager.data
         addr = self.data.get("addr", "")
         recv_port = self.data.get("recv_port", random.randint(1500, 65000))
         self.data.update({"recv_port": recv_port})
@@ -37,16 +38,16 @@ class MessengerGui:
         self.priv_key = self.data.get("priv_key")
         self.pub_key = self.data.get("pub_key", "")
         if not self.priv_key:
-            self.pub_key, self.priv_key = bert_utils.bert_helper.generate_keys_asym()
+            self.pub_key, self.priv_key = helper_udp.generate_keys_asym()
         if not self.pub_key:
-            self.pub_key = bert_utils.bert_helper.generate_pub_key(self.priv_key)
+            self.pub_key = helper_udp.generate_pub_key(self.priv_key)
         self.data.update({"pub_key": self.pub_key})
         self.data.update({"priv_key": self.priv_key})
-        bert_utils.bert_helper.json_file_write(self.data, self.filename)
+        self.config_manager.save()
 
         self.bsd_type = self.data.get("bsd_type", "BertMessenger")
         self.data.update({"bsd_type": self.bsd_type})
-        self.bsd_publisher = bert_utils.helper_multicast.BertMultiPublisher(timeout=2)
+        self.bsd_publisher = helper_multicast.VaultMultiPublisher(timeout=2)
 
         self.app = PyQt6.QtWidgets.QApplication([])
         self.main_window = PyQt6.QtWidgets.QWidget()
@@ -103,11 +104,10 @@ class MessengerGui:
             self.on_click_button_options()
 
         # additional settings
-        self.sock = bert_utils.helper_udp.UDPSocketClass(recv_port=recv_port)
+        self.sock = helper_udp.UDPSocketClass(recv_port=recv_port)
         threading.Timer(0.5, self.thread_start_sock).start()
         self.mh = Message.MessageHandler()
-        # self.me = Message.MessageEncryption(self.priv_key)
-        self.sock.pkse.set_private_key(self.priv_key)
+        helper_udp.set_private_key(self.priv_key)
 
         # sending from mh -> sock to all
         self.mh.mh_send_data.connect(self.sock.send_data)
@@ -226,7 +226,7 @@ class MessengerGui:
                 if name:
                     self.addr_name.update({str(addr_data[0]): (name, time.time())})
                     self.data.update({"name": self.addr_name})
-                bert_utils.bert_helper.json_file_write(self.data, self.filename)
+                self.config_manager.save()
             elif button_ok:
                 self.data.update({"addr": addr})
                 self.sock.update(addr=addr_data)
@@ -240,7 +240,7 @@ class MessengerGui:
         self.addr_box = None
 
     def update_ctl_send(self):
-        ip = bert_utils.helper_ip.get_ips()[0][0]
+        ip = helper_ip.get_ip_addresses()[0][0]
         recv_port = self.sock.recv_port
         name = self.data.get("name", "Test")
         key = self.pub_key
@@ -278,7 +278,7 @@ class MessengerGui:
 
     def on_recv_img(self, img_str="", addr=""):
         # print(img_str)
-        img_bytes = bert_utils.bert_helper.from_base64_byte(img_str)
+        img_bytes = base64.b64decode(img_str)
         time_str = datetime.datetime.now().strftime("%Y%m%d_%H:%M:%S")
 
         if addr and self.addr_name.get(addr[0], ("", 1))[0]:
@@ -304,7 +304,7 @@ class MessengerGui:
         filename = send_file.get("Dateiname")
         file_str = send_file.get("Inhalt")
         # from base64 byte
-        file_byte = bert_utils.bert_helper.from_base64_byte(file_str)
+        file_byte = base64.b64decode(file_str)
         #safe dialog,
         filename = PyQt6.QtWidgets.QFileDialog.getSaveFileName(None, "Save File", filename, "Image File (*.*)")  # filename as String
         if filename:
@@ -324,8 +324,7 @@ class MessengerGui:
         if filename:
             f = open(filename[0], mode='rb')
             file_byte = f.read()
-            file_str = bert_utils.bert_helper.to_base64_str(file_byte)
-            # file_bytes = bert_utils.bert_helper.to_base64_str(file_str)
+            file_str = base64.b64encode(file_byte)
             send_files = {"Dateiname": filename, "Inhalt": file_str}
             message_content = json.dumps(send_files)
             self.gui_send_file.emit(message_content)
@@ -344,7 +343,7 @@ class MessengerGui:
             self.data.update({key: value})
         self.options_window.close_window.disconnect(self.on_close_options_window)
         self.options_window = None
-        bert_utils.bert_helper.json_file_write(self.data, self.filename)
+        self.config_manager.save()
         threading.Timer(0.5, self.thread_start_sock).start()
 
     def thread_start_sock(self):
@@ -377,7 +376,7 @@ class MessengerGui:
             if filename[0]:
                 file = open(filename[0], "rb")
                 data = file.read()
-                data_str = bert_utils.bert_helper.to_base64_str(data)
+                data_str = base64.b64encode(data)
                 self.output_box.addItem("{}: try sending: {}".format(time_str, filename[0]))
                 threading.Timer(1, self.send_img, args=[data_str]).start()
 
@@ -530,7 +529,7 @@ class MessengerGuiOptions(PyQt6.QtWidgets.QWidget):
         self.grid_layout.addWidget(btn_ok)
 
     def on_click_add_ip_bsd(self):
-        self.bsd = bert_utils.gui.BertrandtServiceDiscovery.BertrandtServiceDiscovery(type_filter="BertMessenger")
+        self.bsd = multicast_gui.VaultServiceDiscovery(type_filter="BertMessenger")
         self.bsd.return_signal.connect(self.on_bsd_return)
         self.bsd.show()
 
@@ -544,7 +543,7 @@ class MessengerGuiOptions(PyQt6.QtWidgets.QWidget):
         if return_ip and return_port:
             for i in range(0, len(self.textboxes_addr)):
                 if str(return_ip) != str(self.textboxes_addr[i][0].text()) or str(return_port) != str(
-                        self.textboxes_addr[i][1].text()) and str(return_ip) not in bert_utils.helper_ip.get_ips():
+                        self.textboxes_addr[i][1].text()) and str(return_ip) not in helper_ip.get_ip_addresses():
                     do_add = True
         if do_add:
             self.grid_layout.addWidget(self.ip_port_addr_widget(value.get("addr")))
